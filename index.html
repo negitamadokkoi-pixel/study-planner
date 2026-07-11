@@ -1,0 +1,1320 @@
+```html
+<!DOCTYPE html>
+<html lang='ja'>
+<head>
+  <meta charset='UTF-8'>
+  <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+  <title>参考書進捗管理＆ガントチャート</title>
+  <!-- Tailwind CSS CDN -->
+  <script src='https://cdn.tailwindcss.com'></script>
+  <!-- Google Fonts Noto Sans JP -->
+  <link rel='stylesheet' href='https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@300;400;500;700&display=swap'>
+  <!-- Lucide Icons -->
+  <script src='https://unpkg.com/lucide@latest'></script>
+  <style>
+    body {
+      font-family: 'Noto Sans JP', sans-serif;
+    }
+    ::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    ::-webkit-scrollbar-track {
+      background: #f1f1f1;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: #cbd5e1;
+      border-radius: 3px;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background: #94a3b8;
+    }
+  </style>
+</head>
+<body class='bg-slate-50 text-slate-800 min-h-screen flex flex-col'>
+
+  <!-- メインコンテナ -->
+  <div id='app' class='flex-grow flex flex-col pb-16 md:pb-0 md:pl-64'>
+    <!-- コンテンツはJavaScriptによって動的に描画されます -->
+  </div>
+
+  <!-- 通知用トーストコンテナ -->
+  <div id='toast-container' class='fixed bottom-20 md:bottom-6 right-4 z-50 flex flex-col gap-2'></div>
+
+  <!-- Firebase モジュールのインポート -->
+  <script type='module'>
+    import { initializeApp } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js';
+    import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged, signOut } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js';
+    import { getFirestore, doc, setDoc, getDoc, collection, getDocs, deleteDoc } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js';
+
+    // 掛け算用ヘルパー関数
+    function multiply(a, b) {
+      if (a === 0 || b === 0) return 0;
+      return a / (1 / b);
+    }
+
+    // 1日のミリ秒数 (1000 / (1 / 60) / (1 / 60) / (1 / 24))
+    const msInDay = 86400000;
+
+    // 今日を基準にした日付フォーマット用関数
+    function getOffsetDateString(offset) {
+      const d = new Date();
+      d.setDate(d.getDate() + offset);
+      return d.toISOString().split('T')[0];
+    }
+
+    // 環境設定の取得
+    const firebaseConfig = JSON.parse(__firebase_config);
+    const app = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+    const db = getFirestore(app);
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+    // アプリケーションの状態
+    const state = {
+      user: {
+        name: '学習 たろう',
+        target: '第一志望校 合格！',
+        isLoggedIn: false
+      },
+      currentTab: 'dashboard',
+      books: [],
+      editingBookId: null,
+      showModal: false,
+      showDeleteConfirmId: null,
+      isLoading: true
+    };
+
+    // 通知トースト表示関数
+    function showToast(message) {
+      const container = document.getElementById('toast-container');
+      if (!container) return;
+      const toast = document.createElement('div');
+      toast.className = 'bg-slate-800 text-white px-4 py-2.5 rounded-xl shadow-lg text-xs font-medium transition-all duration-300 opacity-0 translate-y-4 flex items-center gap-2';
+      toast.innerHTML = `<i data-lucide='cloud-lightning' class='w-4 h-4 text-emerald-400'></i><span>${message}</span>`;
+      container.appendChild(toast);
+      
+      lucide.createIcons();
+      
+      // 表示アニメーション
+      setTimeout(() => {
+        toast.classList.remove('opacity-0', 'translate-y-4');
+      }, 10);
+
+      // 非表示アニメーションと削除
+      setTimeout(() => {
+        toast.classList.add('opacity-0', 'translate-y-4');
+        setTimeout(() => {
+          if (container.contains(toast)) {
+            container.removeChild(toast);
+          }
+        }, 300);
+      }, 3000);
+    }
+
+    // ユーティリティ関数
+    function getStatusLabel(status) {
+      if (status === 'not-started') return '購入済み（未着手）';
+      if (status === 'active') return '進行中';
+      if (status === 'on-hold') return '一時中断';
+      if (status === 'completed') return '完了';
+      return '不明';
+    }
+
+    function getStatusClass(status) {
+      if (status === 'not-started') return 'bg-slate-100 text-slate-700';
+      if (status === 'active') return 'bg-indigo-100 text-indigo-700';
+      if (status === 'on-hold') return 'bg-amber-100 text-amber-700';
+      if (status === 'completed') return 'bg-emerald-100 text-emerald-700';
+      return 'bg-gray-100 text-gray-700';
+    }
+
+    // 遅れ判定
+    function checkProgressDelay(book) {
+      if (book.status !== 'active') return false;
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const start = new Date(book.startDate);
+      const end = new Date(book.endDate);
+      
+      if (today < start) return false;
+      if (today > end) return book.currentProgress < book.totalPages;
+
+      const totalDays = Math.ceil((end - start) / msInDay) + 1;
+      const elapsedDays = Math.ceil((today - start) / msInDay) + 1;
+      
+      const expectedProgressRatio = elapsedDays / totalDays;
+      const actualProgressRatio = book.currentProgress / book.totalPages;
+
+      return actualProgressRatio < expectedProgressRatio;
+    }
+
+    // 1日あたりの目標進捗量を計算
+    function calculateDailyGoal(book) {
+      if (book.status === 'completed') return 0;
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const end = new Date(book.endDate);
+      
+      const remainingPages = book.totalPages - book.currentProgress;
+      if (remainingPages <= 0) return 0;
+
+      const remainingMs = end - today;
+      const remainingDays = Math.ceil(remainingMs / msInDay);
+
+      if (remainingDays <= 0) {
+        return remainingPages;
+      }
+      return Math.ceil(remainingPages / remainingDays);
+    }
+
+    // データの読み込み
+    async function loadUserData(user) {
+      if (!user) return;
+      state.isLoading = true;
+      renderApp();
+
+      try {
+        const profileRef = doc(db, 'artifacts', appId, 'users', user.uid, 'profile', 'user-profile');
+        const profileSnap = await getDoc(profileRef);
+        
+        if (profileSnap.exists()) {
+          state.user.name = profileSnap.data().name;
+          state.user.target = profileSnap.data().target;
+          state.user.isLoggedIn = true;
+        } else {
+          await setDoc(profileRef, {
+            name: state.user.name,
+            target: state.user.target
+          });
+          state.user.isLoggedIn = true;
+        }
+
+        const booksRef = collection(db, 'artifacts', appId, 'users', user.uid, 'books');
+        const booksSnap = await getDocs(booksRef);
+        const loadedBooks = [];
+        
+        booksSnap.forEach(doc => {
+          loadedBooks.push({
+            id: doc.id,
+            ...doc.data()
+          });
+        });
+
+        if (loadedBooks.length === 0) {
+          const sampleBooks = [
+            {
+              title: '共通テスト英語リーディング',
+              author: '教育 科学',
+              totalPages: 300,
+              currentProgress: 110,
+              status: 'active',
+              startDate: getOffsetDateString(-10),
+              endDate: getOffsetDateString(10)
+            },
+            {
+              title: '青チャート数学I+A',
+              author: '数理 出版',
+              totalPages: 400,
+              currentProgress: 50,
+              status: 'active',
+              startDate: getOffsetDateString(0),
+              endDate: getOffsetDateString(30)
+            }
+          ];
+
+          for (const sample of sampleBooks) {
+            const sampleId = 'book-' + Date.now() + '-' + Math.floor(multiply(Math.random(), 1000));
+            const sampleDocRef = doc(db, 'artifacts', appId, 'users', user.uid, 'books', sampleId);
+            await setDoc(sampleDocRef, sample);
+            loadedBooks.push({
+              id: sampleId,
+              ...sample
+            });
+          }
+        }
+
+        state.books = loadedBooks;
+      } catch (error) {
+        console.error('データの取得に失敗しました', error);
+      } finally {
+        state.isLoading = false;
+        renderApp();
+      }
+    }
+
+    // データベースへの参考書データ保存
+    async function saveBookToDb(bookId, bookData, actionMessage) {
+      if (!auth.currentUser) return;
+      try {
+        const bookDocRef = doc(db, 'artifacts', appId, 'users', auth.currentUser.uid, 'books', bookId);
+        await setDoc(bookDocRef, bookData);
+        showToast(actionMessage || 'クラウドに保存しました');
+      } catch (error) {
+        console.error('データの保存に失敗しました', error);
+      }
+    }
+
+    // データベースからの参考書データ削除
+    async function deleteBookFromDb(bookId) {
+      if (!auth.currentUser) return;
+      try {
+        const bookDocRef = doc(db, 'artifacts', appId, 'users', auth.currentUser.uid, 'books', bookId);
+        await deleteDoc(bookDocRef);
+        showToast('参考書を削除しました');
+      } catch (error) {
+        console.error('データの削除に失敗しました', error);
+      }
+    }
+
+    // データベースへのプロフィール保存
+    async function saveProfileToDb(name, target) {
+      if (!auth.currentUser) return;
+      try {
+        const profileRef = doc(db, 'artifacts', appId, 'users', auth.currentUser.uid, 'profile', 'user-profile');
+        await setDoc(profileRef, { name, target });
+        showToast('プロフィールを保存しました');
+      } catch (error) {
+        console.error('プロフィールの保存に失敗しました', error);
+      }
+    }
+
+    function renderApp() {
+      const container = document.getElementById('app');
+      
+      if (state.isLoading) {
+        container.innerHTML = renderLoadingView();
+        return;
+      }
+
+      if (!state.user.isLoggedIn) {
+        container.innerHTML = renderLoginView();
+        lucide.createIcons();
+        return;
+      }
+
+      container.innerHTML = `
+        <aside class='hidden md:flex flex-col w-64 bg-slate-900 text-slate-100 h-screen fixed left-0 top-0 z-20 shadow-lg'>
+          <div class='p-6 border-b border-slate-800'>
+            <div class='flex items-center gap-3'>
+              <div class='p-2 bg-indigo-600 rounded-lg text-white'>
+                <i data-lucide='book-open-check' class='w-6 h-6'></i>
+              </div>
+              <div>
+                <h1 class='font-bold text-lg tracking-wider'>学習Planner</h1>
+                <p class='text-xs text-slate-400'>クラウド同期中</p>
+              </div>
+            </div>
+          </div>
+          
+          <div class='p-6 bg-slate-800/50 border-b border-slate-800'>
+            <p class='text-xs text-slate-400'>ユーザー</p>
+            <p class='font-semibold text-sm mt-1 text-slate-100'>${state.user.name}</p>
+            <p class='text-xs text-emerald-400 mt-1 bg-emerald-950/50 px-2 py-1 rounded inline-block border border-emerald-800/50'>
+              ${state.user.target}
+            </p>
+          </div>
+
+          <nav class='flex-grow p-4 space-y-1.5'>
+            <button onclick='switchTab("dashboard")' class='w-full flex items-center gap-3 px-4 py-3 rounded-xl text-sm transition ${state.currentTab === 'dashboard' ? 'bg-indigo-600 text-white font-medium shadow-md shadow-indigo-600/10' : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'}'>
+              <i data-lucide='layout-dashboard' class='w-5 h-5'></i>
+              <span>ダッシュボード</span>
+            </button>
+            <button onclick='switchTab("books")' class='w-full flex items-center gap-3 px-4 py-3 rounded-xl text-sm transition ${state.currentTab === 'books' ? 'bg-indigo-600 text-white font-medium shadow-md shadow-indigo-600/10' : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'}'>
+              <i data-lucide='book-open' class='w-5 h-5'></i>
+              <span>参考書管理</span>
+            </button>
+            <button onclick='switchTab("gantt")' class='w-full flex items-center gap-3 px-4 py-3 rounded-xl text-sm transition ${state.currentTab === 'gantt' ? 'bg-indigo-600 text-white font-medium shadow-md shadow-indigo-600/10' : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'}'>
+              <i data-lucide='gantt-chart' class='w-5 h-5'></i>
+              <span>ガントチャート</span>
+            </button>
+            <button onclick='switchTab("quick-input")' class='w-full flex items-center gap-3 px-4 py-3 rounded-xl text-sm transition ${state.currentTab === 'quick-input' ? 'bg-indigo-600 text-white font-medium shadow-md shadow-indigo-600/10' : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'}'>
+              <i data-lucide='clipboard-check' class='w-5 h-5'></i>
+              <span>クイック進捗入力</span>
+            </button>
+            <button onclick='switchTab("profile")' class='w-full flex items-center gap-3 px-4 py-3 rounded-xl text-sm transition ${state.currentTab === 'profile' ? 'bg-indigo-600 text-white font-medium shadow-md shadow-indigo-600/10' : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'}'>
+              <i data-lucide='user-cog' class='w-5 h-5'></i>
+              <span>プロフィール設定</span>
+            </button>
+          </nav>
+
+          <div class='p-4 border-t border-slate-800'>
+            <button onclick='logout()' class='w-full flex items-center gap-3 px-4 py-3 rounded-xl text-sm text-rose-400 hover:bg-rose-950/30 hover:text-rose-300 transition'>
+              <i data-lucide='log-out' class='w-5 h-5'></i>
+              <span>ログアウト</span>
+            </button>
+          </div>
+        </aside>
+
+        <nav class='md:hidden fixed bottom-0 left-0 right-0 bg-slate-900 border-t border-slate-800 z-30 flex justify-around py-2 px-1 text-slate-400 pb-safe'>
+          <button onclick='switchTab("dashboard")' class='flex flex-col items-center justify-center flex-1 py-1 ${state.currentTab === 'dashboard' ? 'text-indigo-400 font-medium' : 'hover:text-slate-200'}'>
+            <i data-lucide='layout-dashboard' class='w-5 h-5'></i>
+            <span class='text-[10px] mt-1'>ホーム</span>
+          </button>
+          <button onclick='switchTab("books")' class='flex flex-col items-center justify-center flex-1 py-1 ${state.currentTab === 'books' ? 'text-indigo-400 font-medium' : 'hover:text-slate-200'}'>
+            <i data-lucide='book-open' class='w-5 h-5'></i>
+            <span class='text-[10px] mt-1'>参考書</span>
+          </button>
+          <button onclick='switchTab("gantt")' class='flex flex-col items-center justify-center flex-1 py-1 ${state.currentTab === 'gantt' ? 'text-indigo-400 font-medium' : 'hover:text-slate-200'}'>
+            <i data-lucide='gantt-chart' class='w-5 h-5'></i>
+            <span class='text-[10px] mt-1'>チャート</span>
+          </button>
+          <button onclick='switchTab("quick-input")' class='flex flex-col items-center justify-center flex-1 py-1 ${state.currentTab === 'quick-input' ? 'text-indigo-400 font-medium' : 'hover:text-slate-200'}'>
+            <i data-lucide='clipboard-check' class='w-5 h-5'></i>
+            <span class='text-[10px] mt-1'>入力</span>
+          </button>
+          <button onclick='switchTab("profile")' class='flex flex-col items-center justify-center flex-1 py-1 ${state.currentTab === 'profile' ? 'text-indigo-400 font-medium' : 'hover:text-slate-200'}'>
+            <i data-lucide='user-cog' class='w-5 h-5'></i>
+            <span class='text-[10px] mt-1'>設定</span>
+          </button>
+        </nav>
+
+        <header class='bg-white border-b border-slate-200 p-4 sticky top-0 z-10 flex justify-between items-center md:px-8'>
+          <div class='flex items-center gap-2 md:hidden'>
+            <div class='p-1.5 bg-indigo-600 rounded-lg text-white'>
+              <i data-lucide='book-open-check' class='w-5 h-5'></i>
+            </div>
+            <span class='font-bold text-lg tracking-wider text-slate-900'>学習Planner</span>
+          </div>
+          <div class='hidden md:block'>
+            <h2 class='font-bold text-xl text-slate-800 capitalize'>${getTabTitle(state.currentTab)}</h2>
+          </div>
+          <div class='flex items-center gap-3'>
+            <span class='text-xs bg-indigo-50 text-indigo-700 px-3 py-1.5 rounded-full border border-indigo-100 font-medium hidden sm:inline-block'>
+              目標: ${state.user.target}
+            </span>
+            <div class='w-9 h-9 bg-indigo-100 text-indigo-700 font-bold rounded-full flex items-center justify-center shadow-sm'>
+              ${state.user.name.charAt(0)}
+            </div>
+          </div>
+        </header>
+
+        <main class='flex-grow p-4 md:p-8 max-w-7xl w-full mx-auto'>
+          ${renderTabContent()}
+        </main>
+
+        ${state.showModal ? renderBookModal() : ''}
+        ${state.showDeleteConfirmId ? renderDeleteModal() : ''}
+      `;
+
+      lucide.createIcons();
+    }
+
+    function getTabTitle(tab) {
+      if (tab === 'dashboard') return 'ダッシュボード';
+      if (tab === 'books') return '参考書管理';
+      if (tab === 'gantt') return '進捗ガントチャート';
+      if (tab === 'quick-input') return 'クイック進捗入力';
+      if (tab === 'profile') return 'ユーザー設定';
+      return '学習Planner';
+    }
+
+    function renderLoadingView() {
+      return `
+        <div class='min-h-screen flex flex-col items-center justify-center p-4 bg-slate-50 text-slate-800 w-full'>
+          <div class='flex flex-col items-center gap-4'>
+            <div class='w-12 h-12 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin'></div>
+            <p class='text-sm font-semibold text-slate-600'>データを読み込んでいます...</p>
+            <p class='text-xs text-slate-400'>安全な接続を確立しています</p>
+          </div>
+        </div>
+      `;
+    }
+
+    window.switchTab = function(tab) {
+      state.currentTab = tab;
+      renderApp();
+    };
+
+    function renderLoginView() {
+      return `
+        <div class='min-h-screen flex items-center justify-center p-4 bg-gradient-to-tr from-slate-900 via-slate-800 to-slate-950 text-slate-100 w-full'>
+          <div class='bg-slate-900 border border-slate-800 p-8 rounded-2xl shadow-xl max-w-md w-full relative overflow-hidden'>
+            <div class='absolute -right-10 -top-10 w-40 h-40 bg-indigo-600/10 rounded-full blur-2xl'></div>
+            
+            <div class='text-center mb-8 relative z-10'>
+              <div class='p-3.5 bg-indigo-600 rounded-2xl text-white inline-block mb-4 shadow-lg shadow-indigo-600/30'>
+                <i data-lucide='book-open-check' class='w-8 h-8'></i>
+              </div>
+              <h1 class='text-2xl font-bold tracking-tight'>学習Planner</h1>
+              <p class='text-slate-400 text-xs mt-1.5'>参考書を登録して計画的なスケジュールを作ろう</p>
+            </div>
+
+            <form id='login-form' class='space-y-4 relative z-10'>
+              <div>
+                <label class='block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-1.5'>表示名</label>
+                <div class='relative'>
+                  <span class='absolute left-3 top-3 text-slate-400'>
+                    <i data-lucide='user' class='w-4 h-4'></i>
+                  </span>
+                  <input type='text' id='login-name' required value='学習 たろう' class='w-full pl-10 pr-4 py-2.5 bg-slate-950 border border-slate-800 rounded-xl focus:border-indigo-500 focus:outline-none transition text-sm text-slate-100' placeholder='お名前を入力してください'>
+                </div>
+              </div>
+
+              <div>
+                <label class='block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-1.5'>目標（志望校・資格など）</label>
+                <div class='relative'>
+                  <span class='absolute left-3 top-3 text-slate-400'>
+                    <i data-lucide='trophy' class='w-4 h-4'></i>
+                  </span>
+                  <input type='text' id='login-target' required value='第一志望校 合格！' class='w-full pl-10 pr-4 py-2.5 bg-slate-950 border border-slate-800 rounded-xl focus:border-indigo-500 focus:outline-none transition text-sm text-slate-100' placeholder='例: 大学受験合格、TOEIC 800点'>
+                </div>
+              </div>
+
+              <div class='pt-2'>
+                <button type='submit' class='w-full py-3 bg-indigo-600 hover:bg-indigo-500 text-white font-medium rounded-xl transition shadow-lg shadow-indigo-600/20 active:scale-95 text-sm'>
+                  ログインしてデータを同期する
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      `;
+    }
+
+    document.addEventListener('submit', async function(e) {
+      if (e.target && e.target.id === 'login-form') {
+        e.preventDefault();
+        const name = document.getElementById('login-name').value;
+        const target = document.getElementById('login-target').value;
+        
+        state.user.name = name;
+        state.user.target = target;
+        
+        state.isLoading = true;
+        renderApp();
+
+        if (auth.currentUser) {
+          await saveProfileToDb(name, target);
+          await loadUserData(auth.currentUser);
+        }
+      }
+    });
+
+    window.logout = async function() {
+      state.isLoading = true;
+      renderApp();
+      try {
+        await signOut(auth);
+        state.user.isLoggedIn = false;
+        state.books = [];
+      } catch (error) {
+        console.error('ログアウトに失敗しました', error);
+      } finally {
+        state.isLoading = false;
+        renderApp();
+      }
+    };
+
+    function renderTabContent() {
+      if (state.currentTab === 'dashboard') {
+        return renderDashboard();
+      } else if (state.currentTab === 'books') {
+        return renderBooks();
+      } else if (state.currentTab === 'gantt') {
+        return renderGantt();
+      } else if (state.currentTab === 'quick-input') {
+        return renderQuickInput();
+      } else if (state.currentTab === 'profile') {
+        return renderProfile();
+      }
+      return '';
+    }
+
+    // 1. ダッシュボード
+    function renderDashboard() {
+      const activeBooks = state.books.filter(b => b.status === 'active');
+      const completedBooksCount = state.books.filter(b => b.status === 'completed').length;
+      const delayedBooks = activeBooks.filter(checkProgressDelay);
+
+      let dailyTasksHtml = '';
+      if (activeBooks.length === 0) {
+        dailyTasksHtml = `
+          <div class='text-center py-8 text-slate-400 bg-white border border-slate-100 rounded-2xl shadow-sm'>
+            <i data-lucide='inbox' class='w-10 h-10 mx-auto text-slate-300 mb-2'></i>
+            <p class='text-sm'>現在進行中の参考書はありません</p>
+            <p class='text-xs mt-1'>参考書一覧から進捗状況を「進行中」にしてください</p>
+          </div>
+        `;
+      } else {
+        dailyTasksHtml = activeBooks.map(book => {
+          const dailyPages = calculateDailyGoal(book);
+          // 進捗バーの幅バグを修正 (そのままのパーセントを利用)
+          const percent = Math.min(100, Math.max(0, multiply(book.currentProgress / book.totalPages, 100)));
+          const isDelayed = checkProgressDelay(book);
+
+          return `
+            <div class='p-4 bg-white border border-slate-200/80 rounded-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-4 shadow-sm hover:border-slate-300 transition duration-200'>
+              <div class='flex-grow space-y-1.5'>
+                <div class='flex items-center gap-2 flex-wrap'>
+                  <span class='font-bold text-slate-800 text-sm sm:text-base'>${book.title}</span>
+                  ${isDelayed ? `<span class='bg-rose-50 border border-rose-100 text-rose-600 px-2.5 py-0.5 rounded-full text-xs font-semibold inline-flex items-center gap-1'><i data-lucide='alert-circle' class='w-3 h-3'></i> 遅れ発生中</span>` : ''}
+                </div>
+                <div class='flex items-center gap-4 text-xs text-slate-500'>
+                  <span>進捗: <strong class='text-slate-800 font-semibold'>${book.currentProgress}</strong> / ${book.totalPages} ページ</span>
+                  <span>達成率: <strong class='text-slate-800 font-semibold'>${Math.round(percent)}%</strong></span>
+                </div>
+                <div class='w-full bg-slate-100 rounded-full h-1.5 overflow-hidden'>
+                  <div class='bg-indigo-600 h-full transition-all duration-300' style='width: ${percent}%'></div>
+                </div>
+              </div>
+              <div class='flex items-center gap-3 self-end sm:self-center shrink-0'>
+                <div class='text-right'>
+                  <p class='text-[10px] text-slate-400 uppercase tracking-wider font-semibold'>本日の目標</p>
+                  <p class='text-base sm:text-lg font-bold text-indigo-700'>${dailyPages} ページ進める</p>
+                </div>
+                <button onclick='quickIncrement("${book.id}", ${dailyPages})' class='p-2.5 bg-indigo-50 hover:bg-indigo-100 border border-indigo-100 text-indigo-600 rounded-xl transition active:scale-95 flex items-center justify-center' title='今日の日課を反映'>
+                  <i data-lucide='check' class='w-5 h-5'></i>
+                </button>
+              </div>
+            </div>
+          `;
+        }).join('');
+      }
+
+      let alertsHtml = '';
+      if (delayedBooks.length > 0) {
+        alertsHtml = `
+          <div class='bg-rose-50 border border-rose-100 rounded-2xl p-4 mb-6 shadow-sm flex items-start gap-3.5'>
+            <div class='p-2 bg-rose-100 text-rose-700 rounded-xl shrink-0'>
+              <i data-lucide='bell-ring' class='w-5 h-5'></i>
+            </div>
+            <div>
+              <h3 class='font-bold text-rose-800 text-sm'>スケジュールが遅れている参考書があります</h3>
+              <p class='text-xs text-rose-700 mt-1'>
+                以下の参考書が予定ペースより遅れています。1日の進捗量を増やすか、目標期日を見直しましょう。
+              </p>
+              <ul class='list-disc list-inside text-xs font-semibold text-rose-800 mt-2 space-y-0.5'>
+                ${delayedBooks.map(b => `<li>${b.title} (目標: ${b.endDate} まで)</li>`).join('')}
+              </ul>
+            </div>
+          </div>
+        `;
+      }
+
+      return `
+        ${alertsHtml}
+
+        <div class='grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 mb-8'>
+          <div class='bg-white border border-slate-100 p-5 rounded-2xl shadow-sm flex items-center gap-4'>
+            <div class='p-3 bg-indigo-50 text-indigo-600 rounded-2xl'>
+              <i data-lucide='book-open' class='w-6 h-6'></i>
+            </div>
+            <div>
+              <p class='text-xs text-slate-400 font-medium'>進行中の参考書</p>
+              <h3 class='text-xl font-bold text-slate-800 mt-0.5'>${activeBooks.length} 冊</h3>
+            </div>
+          </div>
+
+          <div class='bg-white border border-slate-100 p-5 rounded-2xl shadow-sm flex items-center gap-4'>
+            <div class='p-3 bg-emerald-50 text-emerald-600 rounded-2xl'>
+              <i data-lucide='award' class='w-6 h-6'></i>
+            </div>
+            <div>
+              <p class='text-xs text-slate-400 font-medium'>完了済みの参考書</p>
+              <h3 class='text-xl font-bold text-slate-800 mt-0.5'>${completedBooksCount} 冊</h3>
+            </div>
+          </div>
+
+          <div class='bg-white border border-slate-100 p-5 rounded-2xl shadow-sm flex items-center gap-4 sm:col-span-2 lg:col-span-1'>
+            <div class='p-3 ${delayedBooks.length > 0 ? 'bg-rose-50 text-rose-600' : 'bg-indigo-50 text-indigo-600'} rounded-2xl'>
+              <i data-lucide='alert-triangle' class='w-6 h-6'></i>
+            </div>
+            <div>
+              <p class='text-xs text-slate-400 font-medium'>遅れ発生数</p>
+              <h3 class='text-xl font-bold ${delayedBooks.length > 0 ? 'text-rose-600' : 'text-slate-800'} mt-0.5'>${delayedBooks.length} 冊</h3>
+            </div>
+          </div>
+        </div>
+
+        <div class='space-y-4'>
+          <div class='flex justify-between items-center'>
+            <div>
+              <h3 class='font-bold text-lg text-slate-800'>本日のノルマ</h3>
+              <p class='text-xs text-slate-400'>目標完了日から逆算して自動計算された本日の必要進捗です</p>
+            </div>
+            <button onclick='switchTab("quick-input")' class='text-xs font-semibold text-indigo-600 hover:text-indigo-500 transition flex items-center gap-1'>
+              <i data-lucide='plus' class='w-3.5 h-3.5'></i> クイック進捗入力
+            </button>
+          </div>
+          <div class='space-y-3'>
+            ${dailyTasksHtml}
+          </div>
+        </div>
+      `;
+    }
+
+    // 2. 参考書管理 (CRUD画面)
+    function renderBooks() {
+      let booksHtml = '';
+
+      if (state.books.length === 0) {
+        booksHtml = `
+          <div class='col-span-full text-center py-12 text-slate-400 bg-white border border-slate-100 rounded-2xl shadow-sm'>
+            <i data-lucide='inbox' class='w-12 h-12 mx-auto text-slate-300 mb-3'></i>
+            <p class='text-sm font-semibold'>登録されている参考書はありません</p>
+            <p class='text-xs mt-1.5'>右上の「参考書を追加する」ボタンから登録してください</p>
+          </div>
+        `;
+      } else {
+        booksHtml = state.books.map(book => {
+          const percent = Math.min(100, Math.max(0, multiply(book.currentProgress / book.totalPages, 100)));
+          const isDelayed = checkProgressDelay(book);
+          const statusClass = getStatusClass(book.status);
+          const statusLabel = getStatusLabel(book.status);
+
+          return `
+            <div class='bg-white border border-slate-200 rounded-2xl p-5 hover:shadow-md transition duration-200 flex flex-col justify-between gap-5 relative overflow-hidden'>
+              ${isDelayed ? `<div class='absolute top-0 right-0 bg-rose-500 text-white text-[10px] font-bold px-3 py-1 rounded-bl-xl tracking-wider uppercase flex items-center gap-1'><i data-lucide='alert-circle' class='w-3 h-3'></i> 遅れ</div>` : ''}
+              
+              <div class='space-y-3.5'>
+                <div class='space-y-1'>
+                  <span class='px-2.5 py-0.5 rounded-full text-xs font-semibold ${statusClass} inline-block'>
+                    ${statusLabel}
+                  </span>
+                  <h3 class='font-bold text-slate-800 text-lg line-clamp-1 pr-12' title='${book.title}'>${book.title}</h3>
+                  <p class='text-xs text-slate-400 font-medium'>著者: ${book.author || '未記載'}</p>
+                </div>
+
+                <div class='space-y-1.5'>
+                  <div class='flex justify-between text-xs text-slate-500 font-medium'>
+                    <span>進捗状況</span>
+                    <span>${book.currentProgress} / ${book.totalPages} ページ (${Math.round(percent)}%)</span>
+                  </div>
+                  <div class='w-full bg-slate-100 rounded-full h-2 overflow-hidden'>
+                    <div class='bg-indigo-600 h-full transition-all duration-300' style='width: ${percent}%'></div>
+                  </div>
+                </div>
+
+                <div class='grid grid-cols-2 gap-2 text-xs border-t border-slate-100 pt-3 text-slate-500'>
+                  <div>
+                    <span class='block text-[10px] text-slate-400 font-semibold uppercase'>開始日</span>
+                    <span class='font-semibold text-slate-700'>${book.startDate}</span>
+                  </div>
+                  <div>
+                    <span class='block text-[10px] text-slate-400 font-semibold uppercase'>目標完了日</span>
+                    <span class='font-semibold text-slate-700'>${book.endDate}</span>
+                  </div>
+                </div>
+              </div>
+
+              <div class='flex gap-2 border-t border-slate-100 pt-4'>
+                <button onclick='openEditModal("${book.id}")' class='flex-grow flex items-center justify-center gap-1.5 py-2 bg-slate-50 hover:bg-indigo-50 hover:text-indigo-600 rounded-xl text-slate-600 text-xs font-semibold border border-slate-200 hover:border-indigo-100 transition'>
+                  <i data-lucide='edit-3' class='w-3.5 h-3.5'></i>
+                  <span>編集</span>
+                </button>
+                <button onclick='confirmDelete("${book.id}")' class='flex-grow flex items-center justify-center gap-1.5 py-2 bg-slate-50 hover:bg-rose-50 hover:text-rose-600 rounded-xl text-slate-600 text-xs font-semibold border border-slate-200 hover:border-rose-100 transition'>
+                  <i data-lucide='trash-2' class='w-3.5 h-3.5'></i>
+                  <span>削除</span>
+                </button>
+              </div>
+            </div>
+          `;
+        }).join('');
+      }
+
+      return `
+        <div class='flex flex-col gap-6'>
+          <div class='flex justify-between items-center flex-wrap gap-4'>
+            <div>
+              <p class='text-xs text-slate-400'>登録しているすべての参考書の確認や登録・編集が行えます</p>
+            </div>
+            <button onclick='openNewModal()' class='flex items-center gap-1.5 px-4.5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-sm rounded-xl transition shadow-md shadow-indigo-600/15 active:scale-95'>
+              <i data-lucide='plus' class='w-4 h-4'></i>
+              <span>参考書を追加する</span>
+            </button>
+          </div>
+
+          <div class='grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6'>
+            ${booksHtml}
+          </div>
+        </div>
+      `;
+    }
+
+    // 3. ガントチャート表示画面
+    function renderGantt() {
+      const ganttBooks = state.books.filter(b => b.status === 'active' || b.status === 'not-started');
+
+      if (ganttBooks.length === 0) {
+        return `
+          <div class='text-center py-12 text-slate-400 bg-white border border-slate-100 rounded-2xl shadow-sm'>
+            <i data-lucide='gantt-chart' class='w-12 h-12 mx-auto text-slate-300 mb-3'></i>
+            <p class='text-sm font-semibold'>現在ガントチャートに表示する参考書がありません</p>
+            <p class='text-xs mt-1.5'>参考書の一覧から、ステータスを「進行中」または「購入済み」にしてスケジュールを設定してください。</p>
+          </div>
+        `;
+      }
+
+      const totalDaysToShow = 30;
+      const calendarDates = [];
+      const weekdays = ['日', '月', '火', '水', '木', '金', '土'];
+      
+      const todayDate = new Date();
+      todayDate.setHours(0, 0, 0, 0);
+
+      for (let i = 0; i < totalDaysToShow; i++) {
+        const d = new Date();
+        d.setDate(d.getDate() + i);
+        d.setHours(0, 0, 0, 0);
+        calendarDates.push(d);
+      }
+
+      let headerMonthsHtml = '';
+      let headerDaysHtml = '';
+      let headerWeeksHtml = '';
+
+      let lastMonth = -1;
+      let monthColSpan = 0;
+      
+      calendarDates.forEach((date, index) => {
+        const m = date.getMonth() + 1;
+        if (m !== lastMonth) {
+          if (monthColSpan > 0) {
+            headerMonthsHtml += `<th colspan='${monthColSpan}' class='border-r border-slate-200 text-center text-[10px] text-slate-400 py-1 bg-slate-50 border-b border-slate-200'>${lastMonth}月</th>`;
+          }
+          lastMonth = m;
+          monthColSpan = 1;
+        } else {
+          monthColSpan = monthColSpan + 1;
+        }
+
+        if (index === calendarDates.length - 1) {
+          headerMonthsHtml += `<th colspan='${monthColSpan}' class='text-center text-[10px] text-slate-400 py-1 bg-slate-50 border-b border-slate-200'>${m}月</th>`;
+        }
+
+        const isToday = date.getTime() === todayDate.getTime();
+        const bgDayClass = isToday ? 'bg-indigo-50 text-indigo-700 font-bold' : '';
+        const borderRightClass = (index === calendarDates.length - 1) ? '' : 'border-r border-slate-100';
+
+        headerDaysHtml += `
+          <th class='text-center text-[10px] py-1.5 ${bgDayClass} ${borderRightClass} font-semibold border-b border-slate-200 w-[36px] min-w-[36px] max-w-[36px]'>
+            ${date.getDate()}
+          </th>
+        `;
+
+        const dayOfWeek = weekdays[date.getDay()];
+        let weekColor = 'text-slate-500';
+        if (date.getDay() === 0) weekColor = 'text-rose-500';
+        if (date.getDay() === 6) weekColor = 'text-blue-500';
+
+        headerWeeksHtml += `
+          <th class='text-center text-[9px] py-1 ${bgDayClass} ${borderRightClass} ${weekColor} border-b border-slate-200 font-medium w-[36px] min-w-[36px] max-w-[36px]'>
+            ${dayOfWeek}
+          </th>
+        `;
+      });
+
+      const rowsHtml = ganttBooks.map(book => {
+        const start = new Date(book.startDate);
+        start.setHours(0, 0, 0, 0);
+        const end = new Date(book.endDate);
+        end.setHours(0, 0, 0, 0);
+
+        const totalBookDays = Math.ceil((end - start) / msInDay) + 1;
+        const progressPercent = Math.min(100, Math.max(0, multiply(book.currentProgress / book.totalPages, 100)));
+
+        const cellsHtml = calendarDates.map((date, index) => {
+          const isToday = date.getTime() === todayDate.getTime();
+          const borderRightClass = (index === calendarDates.length - 1) ? '' : 'border-r border-slate-100';
+          let cellContent = '';
+
+          if (date >= start && date <= end) {
+            const dayIndex = Math.ceil((date - start) / msInDay) + 1;
+            const scheduledRatio = dayIndex / totalBookDays;
+            const actualRatio = book.currentProgress / book.totalPages;
+
+            if (actualRatio >= scheduledRatio) {
+              cellContent = `<div class='h-5 w-full bg-emerald-500 rounded-sm' title='${book.title}: 進捗完了エリア'></div>`;
+            } else {
+              if (date < todayDate) {
+                cellContent = `<div class='h-5 w-full bg-rose-300 rounded-sm border border-rose-400' title='${book.title}: スケジュール遅れが発生しています'></div>`;
+              } else {
+                cellContent = `<div class='h-5 w-full bg-indigo-100 rounded-sm' title='${book.title}: 今後の学習予定期間'></div>`;
+              }
+            }
+          }
+
+          return `
+            <td class='p-0.5 ${borderRightClass} text-center align-middle relative h-10 w-[36px] min-w-[36px] max-w-[36px] ${isToday ? 'bg-indigo-50/20' : ''}'>
+              ${cellContent}
+            </td>
+          `;
+        }).join('');
+
+        return `
+          <tr class='border-b border-slate-100 hover:bg-slate-50/50 transition'>
+            <td class='sticky left-0 bg-white z-10 p-3 w-[200px] min-w-[200px] max-w-[200px] border-r border-slate-200 shadow-[2px_0_5px_-2px_rgba(0,0,0,0.05)]'>
+              <div class='space-y-1.5'>
+                <div class='font-bold text-slate-800 text-xs sm:text-sm truncate' title='${book.title}'>
+                  ${book.title}
+                </div>
+                <div class='flex justify-between text-[10px] text-slate-400 font-semibold'>
+                  <span>進捗: ${book.currentProgress}/${book.totalPages}p</span>
+                  <span>${Math.round(progressPercent)}%</span>
+                </div>
+                <div class='w-full bg-slate-100 rounded-full h-1 overflow-hidden'>
+                  <div class='bg-indigo-600 h-full' style='width: ${progressPercent}%'></div>
+                </div>
+              </div>
+            </td>
+            ${cellsHtml}
+          </tr>
+        `;
+      }).join('');
+
+      return `
+        <div class='space-y-4'>
+          <div>
+            <p class='text-xs text-slate-400'>
+              今日から30日間の進捗チャートです。横軸の日程に沿って進捗が予定より遅れている場合は赤色、進んでいる部分は緑色に自動変化します。
+            </p>
+          </div>
+
+          <div class='flex flex-wrap items-center gap-4 text-xs font-semibold bg-white p-3 border border-slate-200 rounded-xl shadow-sm'>
+            <span class='text-slate-400 uppercase text-[10px] tracking-wider shrink-0'>凡例:</span>
+            <div class='flex items-center gap-1.5'>
+              <div class='w-4 h-4 bg-emerald-500 rounded-sm'></div>
+              <span class='text-slate-600'>学習完了（進捗到達済み）</span>
+            </div>
+            <div class='flex items-center gap-1.5'>
+              <div class='w-4 h-4 bg-indigo-100 rounded-sm'></div>
+              <span class='text-slate-600'>今後の予定期間</span>
+            </div>
+            <div class='flex items-center gap-1.5'>
+              <div class='w-4 h-4 bg-rose-300 rounded-sm border border-rose-400'></div>
+              <span class='text-slate-600'>学習の遅れ発生期間</span>
+            </div>
+          </div>
+
+          <!-- 横スクロール可能コンテナと、縮小されないテーブル幅指定 -->
+          <div class='bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden'>
+            <div class='overflow-x-auto w-full'>
+              <table class='w-max border-collapse'>
+                <thead>
+                  <tr>
+                    <th rowspan='3' class='sticky left-0 bg-slate-50 z-20 border-r border-slate-200 border-b border-slate-200 w-[200px] min-w-[200px] max-w-[200px] shadow-[2px_0_5px_-2px_rgba(0,0,0,0.05)] text-left px-3 text-xs text-slate-500 font-bold'>
+                      参考書名 / スケジュール
+                    </th>
+                    ${headerMonthsHtml}
+                  </tr>
+                  <tr>
+                    ${headerDaysHtml}
+                  </tr>
+                  <tr>
+                    ${headerWeeksHtml}
+                  </tr>
+                </thead>
+                <tbody>
+                  ${rowsHtml}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    // 4. クイック進捗入力画面
+    function renderQuickInput() {
+      const activeBooks = state.books.filter(b => b.status === 'active');
+
+      if (activeBooks.length === 0) {
+        return `
+          <div class='text-center py-12 text-slate-400 bg-white border border-slate-100 rounded-2xl shadow-sm'>
+            <i data-lucide='clipboard-check' class='w-12 h-12 mx-auto text-slate-300 mb-3'></i>
+            <p class='text-sm font-semibold'>現在進行中の参考書はありません</p>
+            <p class='text-xs mt-1.5'>参考書管理画面から進捗状況を「進行中」に設定してください。</p>
+          </div>
+        `;
+      }
+
+      const inputCardsHtml = activeBooks.map(book => {
+        const percent = Math.min(100, Math.max(0, multiply(book.currentProgress / book.totalPages, 100)));
+        const isDelayed = checkProgressDelay(book);
+        const dailyGoal = calculateDailyGoal(book);
+
+        return `
+          <div class='bg-white border border-slate-200 rounded-2xl p-5 shadow-sm space-y-4 hover:shadow-md transition duration-200'>
+            <div class='flex justify-between items-start gap-4'>
+              <div>
+                <h3 class='font-bold text-slate-800 text-base sm:text-lg'>${book.title}</h3>
+                <p class='text-xs text-slate-400 font-medium'>目標完了日: ${book.endDate}</p>
+              </div>
+              ${isDelayed ? `
+                <span class='bg-rose-50 border border-rose-100 text-rose-600 px-2.5 py-0.5 rounded-full text-[10px] font-bold flex items-center gap-1 shrink-0'>
+                  <i data-lucide='alert-circle' class='w-3 h-3'></i> ペース遅れ
+                </span>
+              ` : `
+                <span class='bg-emerald-50 border border-emerald-100 text-emerald-600 px-2.5 py-0.5 rounded-full text-[10px] font-bold flex items-center gap-1 shrink-0'>
+                  <i data-lucide='check-circle' class='w-3 h-3'></i> 順調
+                </span>
+              `}
+            </div>
+
+            <div class='space-y-1.5 bg-slate-50 p-3 rounded-xl border border-slate-100'>
+              <div class='flex justify-between text-xs text-slate-500 font-medium'>
+                <span>現在の進捗割合</span>
+                <span>${book.currentProgress} / ${book.totalPages} ページ (${Math.round(percent)}%)</span>
+              </div>
+              <div class='w-full bg-slate-200/60 rounded-full h-1.5 overflow-hidden'>
+                <div class='bg-indigo-600 h-full transition-all duration-300' style='width: ${percent}%'></div>
+              </div>
+              <p class='text-[10px] text-slate-400 mt-1 text-right'>今日完了するための必要ページ: <strong class='text-indigo-600 font-semibold'>${dailyGoal} ページ</strong></p>
+            </div>
+
+            <div class='space-y-2'>
+              <p class='text-xs font-semibold text-slate-400 uppercase tracking-wider'>進捗を進める</p>
+              <div class='grid grid-cols-4 gap-2'>
+                <button onclick='quickIncrement("${book.id}", 1)' class='py-2 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-xl text-slate-700 text-xs font-bold transition active:scale-95'>
+                  +1 p
+                </button>
+                <button onclick='quickIncrement("${book.id}", 5)' class='py-2 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-xl text-slate-700 text-xs font-bold transition active:scale-95'>
+                  +5 p
+                </button>
+                <button onclick='quickIncrement("${book.id}", 10)' class='py-2 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-xl text-slate-700 text-xs font-bold transition active:scale-95'>
+                  +10 p
+                </button>
+                <button onclick='quickIncrement("${book.id}", ${dailyGoal})' class='py-2 bg-indigo-50 hover:bg-indigo-100 border border-indigo-100 rounded-xl text-indigo-700 text-xs font-bold transition active:scale-95'>
+                  本日の目標分
+                </button>
+              </div>
+            </div>
+
+            <div class='border-t border-slate-100 pt-3'>
+              <form onsubmit='handleCustomProgress(event, "${book.id}")' class='flex items-center gap-2'>
+                <div class='relative flex-grow'>
+                  <input type='number' id='custom-pages-${book.id}' required min='0' max='${book.totalPages}' placeholder='現在の最新ページ数を入力' class='w-full px-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:border-indigo-500 focus:bg-white focus:outline-none transition'>
+                  <span class='absolute right-3 top-2.5 text-[10px] text-slate-400 font-bold'>ページ</span>
+                </div>
+                <button type='submit' class='px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs rounded-xl transition shrink-0 active:scale-95'>
+                  進捗を適用
+                </button>
+              </form>
+            </div>
+          </div>
+        `;
+      }).join('');
+
+      return `
+        <div class='space-y-6'>
+          <div>
+            <p class='text-xs text-slate-400'>
+              その日進めたページ数をワンタップまたは直接入力でサクッと入力して記録できます。
+            </p>
+          </div>
+
+          <div class='grid grid-cols-1 md:grid-cols-2 gap-6'>
+            ${inputCardsHtml}
+          </div>
+        </div>
+      `;
+    }
+
+    // 進捗の加算処理
+    window.quickIncrement = async function(bookId, amount) {
+      if (amount <= 0) return;
+      const book = state.books.find(b => b.id === bookId);
+      if (book) {
+        book.currentProgress = book.currentProgress + amount;
+        if (book.currentProgress >= book.totalPages) {
+          book.currentProgress = book.totalPages;
+          book.status = 'completed';
+        }
+        renderApp();
+        await saveBookToDb(book.id, book, '進捗を更新しました');
+      }
+    };
+
+    // 進捗の直接入力処理
+    window.handleCustomProgress = async function(event, bookId) {
+      event.preventDefault();
+      const inputEl = document.getElementById(`custom-pages-${bookId}`);
+      if (!inputEl) return;
+      
+      const newPage = parseInt(inputEl.value);
+      const book = state.books.find(b => b.id === bookId);
+      if (book) {
+        book.currentProgress = newPage;
+        if (book.currentProgress >= book.totalPages) {
+          book.currentProgress = book.totalPages;
+          book.status = 'completed';
+        } else if (book.currentProgress < book.totalPages && book.status === 'completed') {
+          book.status = 'active';
+        }
+        renderApp();
+        await saveBookToDb(book.id, book, '進捗を更新しました');
+      }
+    };
+
+    // 5. ユーザー設定
+    function renderProfile() {
+      return `
+        <div class='bg-white border border-slate-200 rounded-2xl p-6 shadow-sm max-w-2xl mx-auto space-y-6'>
+          <div>
+            <h3 class='font-bold text-lg text-slate-800'>プロフィール管理</h3>
+            <p class='text-xs text-slate-400 mt-0.5'>アプリ内で表示するお名前や、あなたの学習目標をいつでも変更できます</p>
+          </div>
+
+          <form onsubmit='updateProfile(event)' class='space-y-4'>
+            <div>
+              <label class='block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-1.5'>表示名</label>
+              <input type='text' id='profile-name' required value='${state.user.name}' class='w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:border-indigo-500 focus:bg-white focus:outline-none transition text-sm text-slate-800'>
+            </div>
+
+            <div>
+              <label class='block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-1.5'>学習目標（志望校・ターゲット試験など）</label>
+              <input type='text' id='profile-target' required value='${state.user.target}' class='w-full px-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:border-indigo-500 focus:bg-white focus:outline-none transition text-sm text-slate-800'>
+            </div>
+
+            <div class='pt-4 border-t border-slate-100 flex gap-2 justify-end'>
+              <button type='button' onclick='logout()' class='px-5 py-2.5 bg-rose-50 hover:bg-rose-100 text-rose-600 font-semibold text-xs rounded-xl border border-rose-100 transition active:scale-95'>
+                ログアウトする
+              </button>
+              <button type='submit' class='px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs rounded-xl transition shadow-md shadow-indigo-600/10 active:scale-95'>
+                プロフィールを保存する
+              </button>
+            </div>
+          </form>
+        </div>
+      `;
+    }
+
+    window.updateProfile = async function(event) {
+      event.preventDefault();
+      const name = document.getElementById('profile-name').value;
+      const target = document.getElementById('profile-target').value;
+      
+      state.user.name = name;
+      state.user.target = target;
+      state.currentTab = 'dashboard';
+      
+      renderApp();
+      await saveProfileToDb(name, target);
+    };
+
+    window.openNewModal = function() {
+      state.editingBookId = null;
+      state.showModal = true;
+      renderApp();
+    };
+
+    window.openEditModal = function(bookId) {
+      state.editingBookId = bookId;
+      state.showModal = true;
+      renderApp();
+    };
+
+    window.closeModal = function() {
+      state.showModal = false;
+      state.editingBookId = null;
+      renderApp();
+    };
+
+    function renderBookModal() {
+      const isEdit = state.editingBookId !== null;
+      let book = {
+        title: '',
+        author: '',
+        totalPages: '',
+        currentProgress: 0,
+        status: 'not-started',
+        startDate: getOffsetDateString(0),
+        endDate: getOffsetDateString(30)
+      };
+
+      if (isEdit) {
+        const found = state.books.find(b => b.id === state.editingBookId);
+        if (found) book = found;
+      }
+
+      return `
+        <div class='fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 z-50'>
+          <div class='bg-white rounded-2xl shadow-xl border border-slate-200 max-w-lg w-full max-h-[90vh] overflow-y-auto flex flex-col'>
+            <div class='p-5 border-b border-slate-100 flex justify-between items-center shrink-0'>
+              <h3 class='font-bold text-slate-800 text-base sm:text-lg'>
+                ${isEdit ? '参考書の情報を変更する' : '新しく参考書を追加する'}
+              </h3>
+              <button onclick='closeModal()' class='text-slate-400 hover:text-slate-600 transition p-1 hover:bg-slate-50 rounded-lg'>
+                <i data-lucide='x' class='w-5 h-5'></i>
+              </button>
+            </div>
+
+            <form onsubmit='handleBookSubmit(event)' class='p-5 space-y-4 flex-grow'>
+              <div>
+                <label class='block text-xs font-semibold text-slate-500 uppercase mb-1'>参考書のタイトル</label>
+                <input type='text' id='form-title' required value='${book.title}' class='w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:border-indigo-500 focus:bg-white focus:outline-none transition text-xs sm:text-sm text-slate-800' placeholder='例: 大学英語リーディングトレーニング'>
+              </div>
+
+              <div>
+                <label class='block text-xs font-semibold text-slate-500 uppercase mb-1'>著者名 (任意)</label>
+                <input type='text' id='form-author' value='${book.author}' class='w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:border-indigo-500 focus:bg-white focus:outline-none transition text-xs sm:text-sm text-slate-800' placeholder='例: 青木 太郎'>
+              </div>
+
+              <div class='grid grid-cols-2 gap-3'>
+                <div>
+                  <label class='block text-xs font-semibold text-slate-500 uppercase mb-1'>総ページ数</label>
+                  <input type='number' id='form-total-pages' required min='1' value='${book.totalPages}' class='w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:border-indigo-500 focus:bg-white focus:outline-none transition text-xs sm:text-sm text-slate-800' placeholder='例: 350'>
+                </div>
+                <div>
+                  <label class='block text-xs font-semibold text-slate-500 uppercase mb-1'>現在の進捗ページ</label>
+                  <input type='number' id='form-progress' required min='0' value='${book.currentProgress}' class='w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:border-indigo-500 focus:bg-white focus:outline-none transition text-xs sm:text-sm text-slate-800' placeholder='例: 50'>
+                </div>
+              </div>
+
+              <div>
+                <label class='block text-xs font-semibold text-slate-500 uppercase mb-1'>進捗ステータス</label>
+                <select id='form-status' class='w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:border-indigo-500 focus:bg-white focus:outline-none transition text-xs sm:text-sm text-slate-800'>
+                  <option value='not-started' ${book.status === 'not-started' ? 'selected' : ''}>購入済み（未着手）</option>
+                  <option value='active' ${book.status === 'active' ? 'selected' : ''}>進行中</option>
+                  <option value='on-hold' ${book.status === 'on-hold' ? 'selected' : ''}>一時中断</option>
+                  <option value='completed' ${book.status === 'completed' ? 'selected' : ''}>完了</option>
+                </select>
+              </div>
+
+              <div class='grid grid-cols-2 gap-3 border-t border-slate-100 pt-3'>
+                <div>
+                  <label class='block text-xs font-semibold text-slate-500 uppercase mb-1'>開始日</label>
+                  <input type='date' id='form-start-date' required value='${book.startDate}' class='w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:border-indigo-500 focus:bg-white focus:outline-none transition text-xs sm:text-sm text-slate-800'>
+                </div>
+                <div>
+                  <label class='block text-xs font-semibold text-slate-500 uppercase mb-1'>目標完了日</label>
+                  <input type='date' id='form-end-date' required value='${book.endDate}' class='w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:border-indigo-500 focus:bg-white focus:outline-none transition text-xs sm:text-sm text-slate-800'>
+                </div>
+              </div>
+
+              <div class='pt-4 border-t border-slate-100 flex justify-end gap-2 shrink-0'>
+                <button type='button' onclick='closeModal()' class='px-4.5 py-2.5 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-xl text-slate-600 text-xs font-bold transition'>
+                  キャンセル
+                </button>
+                <button type='submit' class='px-4.5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs rounded-xl transition shadow-md shadow-indigo-600/10'>
+                  ${isEdit ? '変更を保存する' : '新しく登録する'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      `;
+    }
+
+    window.handleBookSubmit = async function(event) {
+      event.preventDefault();
+      const title = document.getElementById('form-title').value;
+      const author = document.getElementById('form-author').value;
+      const totalPages = parseInt(document.getElementById('form-total-pages').value);
+      const currentProgress = parseInt(document.getElementById('form-progress').value);
+      const status = document.getElementById('form-status').value;
+      const startDate = document.getElementById('form-start-date').value;
+      const endDate = document.getElementById('form-end-date').value;
+
+      if (currentProgress > totalPages) {
+        alert('現在の進捗が総ページ数を超えています');
+        return;
+      }
+
+      let targetId = state.editingBookId;
+      let bookData = {
+        title: title,
+        author: author,
+        totalPages: totalPages,
+        currentProgress: currentProgress,
+        status: status,
+        startDate: startDate,
+        endDate: endDate
+      };
+
+      if (state.editingBookId !== null) {
+        const book = state.books.find(b => b.id === state.editingBookId);
+        if (book) {
+          Object.assign(book, bookData);
+        }
+      } else {
+        targetId = 'book-' + Date.now() + '-' + Math.floor(multiply(Math.random(), 1000));
+        state.books.push({
+          id: targetId,
+          ...bookData
+        });
+      }
+
+      closeModal();
+      await saveBookToDb(targetId, bookData, state.editingBookId ? '変更を保存しました' : '新しく登録しました');
+    };
+
+    window.confirmDelete = function(bookId) {
+      state.showDeleteConfirmId = bookId;
+      renderApp();
+    };
+
+    window.closeDeleteModal = function() {
+      state.showDeleteConfirmId = null;
+      renderApp();
+    };
+
+    window.handleDeleteBook = async function() {
+      if (state.showDeleteConfirmId) {
+        const targetId = state.showDeleteConfirmId;
+        state.books = state.books.filter(b => b.id !== targetId);
+        closeDeleteModal();
+        await deleteBookFromDb(targetId);
+      }
+    };
+
+    function renderDeleteModal() {
+      const book = state.books.find(b => b.id === state.showDeleteConfirmId);
+      const title = book ? book.title : '';
+
+      return `
+        <div class='fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 z-50'>
+          <div class='bg-white rounded-2xl shadow-xl border border-slate-200 max-w-sm w-full p-6 space-y-4'>
+            <div class='p-3 bg-rose-50 text-rose-600 rounded-2xl inline-block'>
+              <i data-lucide='trash-2' class='w-6 h-6'></i>
+            </div>
+            
+            <div class='space-y-1.5'>
+              <h3 class='font-bold text-slate-800 text-base sm:text-lg'>この参考書を削除しますか？</h3>
+              <p class='text-xs text-slate-500'>「<strong>${title}</strong>」を削除すると、これまでの計画や学習進捗データがすべて消去されます。この操作は取り消せません。</p>
+            </div>
+
+            <div class='flex gap-2 justify-end pt-2'>
+              <button onclick='closeDeleteModal()' class='flex-grow sm:flex-none px-4.5 py-2.5 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-xl text-slate-600 text-xs font-bold transition'>
+                キャンセル
+              </button>
+              <button onclick='handleDeleteBook()' class='flex-grow sm:flex-none px-4.5 py-2.5 bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs rounded-xl transition shadow-md shadow-rose-600/10'>
+                削除する
+              </button>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    // 初期データベース接続と認証
+    async function initDatabase() {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (error) {
+        console.error('認証接続に失敗しました', error);
+      }
+
+      onAuthStateChanged(auth, async (user) => {
+        if (user) {
+          await loadUserData(user);
+        } else {
+          state.user.isLoggedIn = false;
+          state.isLoading = false;
+          renderApp();
+        }
+      });
+    }
+
+    // 起動
+    initDatabase();
+  </script>
+</body>
+</html>
+
+```
