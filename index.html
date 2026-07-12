@@ -7,7 +7,7 @@
   <!-- Tailwind CSS CDN -->
   <script src='https://cdn.tailwindcss.com'></script>
   <!-- Google Fonts Noto Sans JP -->
-  <link rel='stylesheet' href='https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@300;400;500;700&display=swap'>
+  <link rel='stylesheet' href='https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght=300;400;500;700&display=swap'>
   <!-- Lucide Icons -->
   <script src='https://unpkg.com/lucide@latest'></script>
   <style>
@@ -62,12 +62,32 @@
       return d.toISOString().split('T')[0];
     }
 
-    // 環境設定の取得
-    const firebaseConfig = JSON.parse(__firebase_config);
-    const app = initializeApp(firebaseConfig);
-    const auth = getAuth(app);
-    const db = getFirestore(app);
-    const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+    // 環境設定の安全な取得
+    let firebaseConfig = null;
+    let appId = 'default-app-id';
+    let isFirebaseAvailable = false;
+
+    try {
+      if (typeof __firebase_config !== 'undefined' && __firebase_config) {
+        firebaseConfig = JSON.parse(__firebase_config);
+        isFirebaseAvailable = true;
+      }
+      if (typeof __app_id !== 'undefined' && __app_id) {
+        appId = __app_id;
+      }
+    } catch (e) {
+      console.log('Firebase設定が読み込めないため、ローカル保存モードで動作します');
+    }
+
+    // Firebaseアプリの初期化
+    let app = null;
+    let auth = null;
+    let db = null;
+    if (isFirebaseAvailable && firebaseConfig) {
+      app = initializeApp(firebaseConfig);
+      auth = getAuth(app);
+      db = getFirestore(app);
+    }
 
     // アプリケーションの状態
     const state = {
@@ -169,10 +189,67 @@
 
     // データの読み込み
     async function loadUserData(user) {
-      if (!user) return;
       state.isLoading = true;
       renderApp();
 
+      if (!isFirebaseAvailable) {
+        // ローカルストレージからの読み込みモード
+        try {
+          const savedProfile = localStorage.getItem('study_planner_profile');
+          if (savedProfile) {
+            const parsedProfile = JSON.parse(savedProfile);
+            state.user.name = parsedProfile.name;
+            state.user.target = parsedProfile.target;
+            state.user.isLoggedIn = true;
+          } else {
+            state.user.isLoggedIn = true;
+            localStorage.setItem('study_planner_profile', JSON.stringify({
+              name: state.user.name,
+              target: state.user.target
+            }));
+          }
+
+          const savedBooks = localStorage.getItem('study_planner_books');
+          if (savedBooks) {
+            state.books = JSON.parse(savedBooks);
+          } else {
+            // デフォルトのサンプルデータ
+            const defaultBooks = [
+              {
+                id: 'book-1',
+                title: '共通テスト英語リーディング',
+                author: '教育 科学',
+                totalPages: 300,
+                currentProgress: 110,
+                status: 'active',
+                startDate: getOffsetDateString(-10),
+                endDate: getOffsetDateString(10)
+              },
+              {
+                id: 'book-2',
+                title: '青チャート数学I+A',
+                author: '数理 出版',
+                totalPages: 400,
+                currentProgress: 50,
+                status: 'active',
+                startDate: getOffsetDateString(0),
+                endDate: getOffsetDateString(30)
+              }
+            ];
+            state.books = defaultBooks;
+            localStorage.setItem('study_planner_books', JSON.stringify(defaultBooks));
+          }
+        } catch (error) {
+          console.error('ローカルストレージの読み込みに失敗しました', error);
+        } finally {
+          state.isLoading = false;
+          renderApp();
+        }
+        return;
+      }
+
+      // Firebaseからの読み込みモード
+      if (!user) return;
       try {
         const profileRef = doc(db, 'artifacts', appId, 'users', user.uid, 'profile', 'user-profile');
         const profileSnap = await getDoc(profileRef);
@@ -242,8 +319,21 @@
       }
     }
 
-    // データベースへの参考書データ保存
+    // 参考書データの保存
     async function saveBookToDb(bookId, bookData, actionMessage) {
+      if (!isFirebaseAvailable) {
+        // ローカルストレージに保存
+        const index = state.books.findIndex(b => b.id === bookId);
+        if (index !== -1) {
+          state.books[index] = { id: bookId, ...bookData };
+        } else {
+          state.books.push({ id: bookId, ...bookData });
+        }
+        localStorage.setItem('study_planner_books', JSON.stringify(state.books));
+        showToast((actionMessage || '保存しました') + ' (ブラウザ保存)');
+        return;
+      }
+
       if (!auth.currentUser) return;
       try {
         const bookDocRef = doc(db, 'artifacts', appId, 'users', auth.currentUser.uid, 'books', bookId);
@@ -254,8 +344,15 @@
       }
     }
 
-    // データベースからの参考書データ削除
+    // 参考書データの削除
     async function deleteBookFromDb(bookId) {
+      if (!isFirebaseAvailable) {
+        state.books = state.books.filter(b => b.id !== bookId);
+        localStorage.setItem('study_planner_books', JSON.stringify(state.books));
+        showToast('参考書を削除しました (ブラウザ保存)');
+        return;
+      }
+
       if (!auth.currentUser) return;
       try {
         const bookDocRef = doc(db, 'artifacts', appId, 'users', auth.currentUser.uid, 'books', bookId);
@@ -266,8 +363,17 @@
       }
     }
 
-    // データベースへのプロフィール保存
+    // プロフィールの保存
     async function saveProfileToDb(name, target) {
+      if (!isFirebaseAvailable) {
+        state.user.name = name;
+        state.user.target = target;
+        state.user.isLoggedIn = true;
+        localStorage.setItem('study_planner_profile', JSON.stringify({ name, target }));
+        showToast('プロフィールを保存しました (ブラウザ保存)');
+        return;
+      }
+
       if (!auth.currentUser) return;
       try {
         const profileRef = doc(db, 'artifacts', appId, 'users', auth.currentUser.uid, 'profile', 'user-profile');
@@ -301,7 +407,7 @@
               </div>
               <div>
                 <h1 class='font-bold text-lg tracking-wider'>学習Planner</h1>
-                <p class='text-xs text-slate-400'>クラウド同期中</p>
+                <p class='text-xs text-slate-400'>${isFirebaseAvailable ? 'クラウド同期中' : 'ブラウザ保存モード'}</p>
               </div>
             </div>
           </div>
@@ -483,9 +589,13 @@
         state.isLoading = true;
         renderApp();
 
-        if (auth.currentUser) {
+        if (isFirebaseAvailable && auth.currentUser) {
           await saveProfileToDb(name, target);
           await loadUserData(auth.currentUser);
+        } else {
+          // ローカル保存用
+          await saveProfileToDb(name, target);
+          await loadUserData(null);
         }
       }
     });
@@ -493,6 +603,17 @@
     window.logout = async function() {
       state.isLoading = true;
       renderApp();
+      
+      if (!isFirebaseAvailable) {
+        localStorage.removeItem('study_planner_profile');
+        localStorage.removeItem('study_planner_books');
+        state.user.isLoggedIn = false;
+        state.books = [];
+        state.isLoading = false;
+        renderApp();
+        return;
+      }
+
       try {
         await signOut(auth);
         state.user.isLoggedIn = false;
@@ -538,7 +659,6 @@
       } else {
         dailyTasksHtml = activeBooks.map(book => {
           const dailyPages = calculateDailyGoal(book);
-          // 進捗バーの幅バグを修正 (そのままのパーセントを利用)
           const percent = Math.min(100, Math.max(0, multiply(book.currentProgress / book.totalPages, 100)));
           const isDelayed = checkProgressDelay(book);
 
@@ -886,7 +1006,6 @@
             </div>
           </div>
 
-          <!-- 横スクロール可能コンテナと、縮小されないテーブル幅指定 -->
           <div class='bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden'>
             <div class='overflow-x-auto w-full'>
               <table class='w-max border-collapse'>
@@ -1289,6 +1408,13 @@
 
     // 初期データベース接続と認証
     async function initDatabase() {
+      if (!isFirebaseAvailable) {
+        // Firebaseが使用不可能な場合は、安全にローカル保存モードで起動
+        state.user.isLoggedIn = true;
+        await loadUserData(null);
+        return;
+      }
+
       try {
         if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
           await signInWithCustomToken(auth, __initial_auth_token);
